@@ -49,6 +49,10 @@ typedef struct {
     pid_t child_pid;
     int output_fd;
 
+    /* State for executing a source script */
+    FILE *source_file; // FILE *source_file keeps the script open while its commands run.
+    int source_active; // source_active tells the terminal whether a script is currently being executed.
+
     char output_line[LINE_LENGTH];
     size_t output_used;
 } Tab;
@@ -320,6 +324,65 @@ static void expand_last_status(const char *input,
 
     output[j] = '\0';
 }
+static void continue_source(Tab *tab);
+static pid_t start_command(Tab *tab, char *command);
+
+
+static int execute_source_file(Tab *tab, const char *filename)
+{
+    char path[PATH_MAX];
+
+    /* Prevent multiple scripts running in the same tab. */
+    if (tab->source_active) {
+        add_line(&tab->output,
+                 "source: a script is already running in this tab");
+        tab->last_status = 1;
+        return 1;
+    }
+
+    /* Resolve the script path relative to this tab's directory. */
+    if (filename[0] == '/') {
+        int written = snprintf(path, sizeof(path), "%s", filename);
+
+        if (written < 0 || (size_t)written >= sizeof(path)) {
+            add_line(&tab->output, "source: filename is too long");
+            tab->last_status = 1;
+            return 1;
+        }
+    } else {
+        int written = snprintf(path, sizeof(path), "%s/%s",
+                               tab->cwd, filename);
+
+        if (written < 0 || (size_t)written >= sizeof(path)) {
+            add_line(&tab->output, "source: filename is too long");
+            tab->last_status = 1;
+            return 1;
+        }
+    }
+
+    /* Open the script file. */
+    tab->source_file = fopen(path, "r");
+
+    if (tab->source_file == NULL) {
+        char message[LINE_LENGTH];
+
+        snprintf(message, sizeof(message),
+                 "source: cannot open %s: %s",
+                 filename, strerror(errno));
+
+        add_line(&tab->output, message);
+        tab->last_status = 1;
+        return 1;
+    }
+
+    /* Mark the script as active and begin processing it. */
+    tab->source_active = 1;
+    continue_source(tab);
+
+    return 0;
+}
+
+
 
 
 static pid_t start_command(Tab *tab, char *command)
@@ -338,6 +401,15 @@ static pid_t start_command(Tab *tab, char *command)
 
     if (argc == 0)
         return -1;
+    if (strcmp(args[0], "source") == 0) { // Connect source to start_command() ...basically how script file runs 
+    if (argc < 2) {
+        add_line(&tab->output, "source: filename required");
+        tab->last_status = 1;
+    } else {
+        execute_source_file(tab, args[1]);
+    }
+    return -1;
+    }
 
     if (strcmp(args[0], "cd") == 0) {
     tab->last_status =
@@ -447,7 +519,61 @@ static void finish_command(Tab *tab)
 
     add_line(&tab->output, "[Command finished]");
     tab->output.scroll = 0;
+    if (tab->source_active) // This resumes the script after each external command finishes.
+        continue_source(tab);
 }
+
+static void continue_source(Tab *tab)
+{
+    char line[TERMINATOR_MAX_INPUT];
+
+    while (tab->source_active && tab->source_file != NULL) {
+        char *start;
+        char expanded[TERMINATOR_MAX_INPUT];
+
+        if (fgets(line, sizeof(line), tab->source_file) == NULL) {
+            if (ferror(tab->source_file)) {
+                add_line(&tab->output, "source: error reading script");
+                tab->last_status = 1;
+            }
+
+            fclose(tab->source_file);
+            tab->source_file = NULL;
+            tab->source_active = 0;
+            return;
+        }
+
+        line[strcspn(line, "\r\n")] = '\0';
+        start = line;
+
+        while (*start == ' ' || *start == '\t')
+            start++;
+
+        if (*start == '\0' || *start == '#')
+            continue;
+
+        expand_last_status(start, tab->last_status,
+                           expanded, sizeof(expanded));
+
+        char command[TERMINATOR_MAX_INPUT];
+        snprintf(command, sizeof(command), "%s", expanded);
+
+        pid_t result = start_command(tab, command);
+
+        if (result == -2) {
+            add_line(&tab->output,
+                     "source: exit inside a script is not supported");
+            tab->last_status = 1;
+            continue;
+        }
+
+        if (result > 0) {
+            tab->child_pid = result;
+            return; /* Wait for this command before reading the next. */
+        }
+    }
+}
+
 
 /* Close one tab and release its resources. */
 static int close_tab(int index)
