@@ -238,7 +238,7 @@ for (int i = 0; i < tab_count; i++) {
     XFlush(display);
 }
 
-static void change_directory(Tab *tab, const char *dir)
+static int change_directory(Tab *tab, const char *dir)
 {
     char candidate[PATH_MAX];
     char resolved[PATH_MAX];
@@ -255,20 +255,21 @@ static void change_directory(Tab *tab, const char *dir)
         written = snprintf(candidate, sizeof(candidate), "%s", dir);
     } else {
         written = snprintf(candidate, sizeof(candidate),
-        "%s/%s", tab->cwd, dir);
+                           "%s/%s", tab->cwd, dir);
     }
 
     if (written < 0 || (size_t)written >= sizeof(candidate)) {
         add_line(&tab->output, "cd: path is too long");
-        return;
+        return 1;
     }
 
     if (realpath(candidate, resolved) == NULL) {
         add_line(&tab->output, "cd: directory not found");
-        return;
+        return 1;
     }
 
     snprintf(tab->cwd, sizeof(tab->cwd), "%s", resolved);
+    return 0;
 }
 static void save_history(Tab *tab, const char *command)
 {
@@ -293,6 +294,33 @@ static void save_history(Tab *tab, const char *command)
     /* The next Up key should recall the latest command. */
     tab->history_position = tab->history_count;
 }
+static void expand_last_status(const char *input,
+                               int status,
+                               char *output,
+                               size_t output_size)
+{
+    char status_text[16];
+    snprintf(status_text, sizeof(status_text), "%d", status);
+
+    size_t i = 0;
+    size_t j = 0;
+    size_t status_len = strlen(status_text);
+
+    while (input[i] != '\0' && j + 1 < output_size) {
+        if (input[i] == '$' && input[i + 1] == '?') {
+            for (size_t k = 0;
+                 k < status_len && j + 1 < output_size; k++) {
+                output[j++] = status_text[k];
+            }
+            i += 2;
+        } else {
+            output[j++] = input[i++];
+        }
+    }
+
+    output[j] = '\0';
+}
+
 
 static pid_t start_command(Tab *tab, char *command)
 {
@@ -312,8 +340,10 @@ static pid_t start_command(Tab *tab, char *command)
         return -1;
 
     if (strcmp(args[0], "cd") == 0) {
+    tab->last_status =
         change_directory(tab, argc > 1 ? args[1] : NULL);
-        return -1;
+
+    return -1;
     }
     if (strcmp(args[0], "history") == 0) {
     char line[LINE_LENGTH];
@@ -324,13 +354,13 @@ static pid_t start_command(Tab *tab, char *command)
 
         add_line(&tab->output, line);
     }
-
+    tab->last_status = 0;
     return -1;
     }
 
-    if (strcmp(args[0], "exit") == 0) {
-        add_line(&tab->output, "Use Escape to close Terminator.");
-        return -1;
+    if (strcmp(args[0], "exit") == 0) { // now when you type "exit" --> it will close the current tab -> we tell -2 to close the current tab 
+        //Line number 793
+    return -2;
     }
 
     int pipefd[2];
@@ -399,8 +429,20 @@ static void finish_command(Tab *tab)
     }
 
     if (tab->child_pid > 0) {
-        waitpid(tab->child_pid, NULL, 0);
-        tab->child_pid = -1;
+    int status = 0;
+    pid_t result;
+
+    do {
+        result = waitpid(tab->child_pid, &status, 0);
+    } while (result == -1 && errno == EINTR);
+    if (result > 0) {
+        if (WIFEXITED(status)) {
+            tab->last_status = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            tab->last_status = 128 + WTERMSIG(status);
+        }
+    }
+    tab->child_pid = -1;
     }
 
     add_line(&tab->output, "[Command finished]");
@@ -735,11 +777,30 @@ int main(void)
                          "A command is already running in this tab.");
             } else {
                 char command[TERMINATOR_MAX_INPUT];
+                char expanded_command[TERMINATOR_MAX_INPUT];
 
                 snprintf(command, sizeof(command), "%s", tab->input);
+
+                /* Save the original command in history. */
                 save_history(tab, command);
 
-                tab->child_pid = start_command(tab, command);
+                /* Expand $? using the previous exit status. */
+                expand_last_status(command, tab->last_status,
+                expanded_command, sizeof(expanded_command));
+                pid_t command_result = start_command(tab, expanded_command);
+
+                if (command_result == -2) {
+                    running = close_tab(active_tab) == 0; // here we explicitly declared  -2 closes the current tab
+                    if (running) {
+                        redraw(display, window, gc);
+                    }
+                    if (!running) {
+                        break;
+                    }
+                    continue;
+                }
+                tab->child_pid = command_result;
+                //
                 tab->output_used = 0;
                 tab->output_line[0] = '\0';
             }
